@@ -1,0 +1,13 @@
+# Roles that can be requested and auto-approved via pull request.
+# Anything not listed here fails CI validation before a human even
+# reviews the PR. Denied roles fail even if someone adds them to
+# allowedRoles by mistake - deny always wins.
+
+allowedRoles:
+  - Reader
+  - Contributor
+  - Storage Blob Data Contributor
+
+deniedRoles:
+  - Owner
+  - User Access Administrator

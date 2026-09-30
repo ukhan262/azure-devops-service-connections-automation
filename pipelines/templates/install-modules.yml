@@ -1,0 +1,23 @@
+# Installs the PowerShell modules Common.psm1 requires. Self-hosted agents
+# are expected to have these preinstalled (see README); Microsoft-hosted
+# images don't ship Microsoft.Graph or powershell-yaml, and a plain
+# PowerShell@2 task doesn't load the image's bundled Az modules, so
+# hosted runs install them per job.
+
+parameters:
+  - name: poolType
+    type: string
+
+steps:
+  - ${{ if eq(parameters.poolType, 'microsoftHosted') }}:
+    - task: PowerShell@2
+      displayName: 'Install PowerShell modules (Microsoft-hosted agent)'
+      inputs:
+        targetType: inline
+        pwsh: true
+        script: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module -Scope CurrentUser -Force -AllowClobber -Name `
+            Az.Accounts, Az.KeyVault, Az.Resources, `
+            Microsoft.Graph.Authentication, Microsoft.Graph.Applications, `
+            powershell-yaml

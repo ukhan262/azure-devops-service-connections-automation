@@ -1,0 +1,12 @@
+# One file per subscription/environment - this is the entire desired
+# state the automation reads. Everything else is looked up live.
+
+subscriptionId: "0000000-0000-0000-0000-0000000000"
+subscriptionName: "tc-development"
+environment: "dev"
+connectionName: "sc-tc-development"
+roles:
+  - "Contributor"
+scope: ""            # leave blank for subscription-wide, or set a resource group name
+authType: "clientSecret"   # clientSecret | certificate | wif (workload identity federation)
+requestedBy: "umar@example.com"

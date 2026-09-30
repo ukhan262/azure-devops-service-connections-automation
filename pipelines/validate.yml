@@ -1,0 +1,106 @@
+# CI: runs on every pull request that touches config/, before merge.
+# This is the check that replaces "wait for security to process a
+# ticket" - security's approval is still required (via branch policy /
+# CODEOWNERS), but this build gate catches bad requests before a human
+# even looks at them.
+
+trigger: none
+
+# Azure Repos Git ignores this block - PR runs come from a Build
+# validation branch policy on main (path filter /config/*). Kept for
+# GitHub/Bitbucket-hosted copies and as documentation.
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - config/*.yaml
+
+parameters:
+  - name: poolType
+    displayName: 'Agent pool type'
+    type: string
+    default: microsoftHosted
+    values:
+      - selfHosted        # your own agents (required on Azure DevOps Server)
+      - microsoftHosted   # Azure Pipelines hosted agents (Azure DevOps Services only)
+  - name: selfHostedPoolName
+    displayName: 'Self-hosted pool name'
+    type: string
+    default: 'OnPremAgents'
+  - name: vmImage
+    displayName: 'Microsoft-hosted image'
+    type: string
+    default: 'ubuntu-latest'
+
+jobs:
+  - job: Validate
+    displayName: 'Validate subscription requests'
+    # Conditionals aren't allowed inside a pipeline-level pool:, so the
+    # whole pool key is inserted conditionally at the job level instead.
+    ${{ if eq(parameters.poolType, 'selfHosted') }}:
+      pool:
+        name: ${{ parameters.selfHostedPoolName }}
+    ${{ if eq(parameters.poolType, 'microsoftHosted') }}:
+      pool:
+        vmImage: ${{ parameters.vmImage }}
+    steps:
+      - checkout: self
+        fetchDepth: 0   # need history to diff against the target branch
+
+      - template: templates/install-modules.yml
+        parameters:
+          poolType: ${{ parameters.poolType }}
+
+      - task: PowerShell@2
+        displayName: 'Validate changed subscription requests'
+        inputs:
+          targetType: inline
+          pwsh: true
+          script: |
+            Import-Module "$(Build.SourcesDirectory)/scripts/common/Common.psm1" -Force
+
+            # PR runs set TARGET_BRANCH to refs/heads/<branch>; manual runs
+            # leave the macro unexpanded, so fall back to main.
+            $target = $env:TARGET_BRANCH
+            if (-not $target -or $target -like '*$(*') { $target = 'main' }
+            $target = $target -replace '^refs/heads/', ''
+            Write-Output "Diffing config/ against origin/$target"
+
+            $changed = git diff --name-only --diff-filter=d "origin/$target...HEAD" -- config/*.yaml   # skip deleted configs
+            if (-not $changed) {
+              Write-Output "No config changes in this PR."
+              exit 0
+            }
+
+            $hasError = $false
+
+            foreach ($file in $changed) {
+              try {
+                $request = Get-SubscriptionRequest -Path $file
+                Test-AllowedRoles -RequestedRoles $request.Roles
+                Write-Log "OK: $file requests $($request.Roles -join ', ') on $($request.SubscriptionName) using $($request.AuthType)"
+              } catch {
+                Write-Log "FAILED: $file - $_" -Level ERROR
+                $hasError = $true
+              }
+            }
+
+            # Each request gets its own identity named from its connection
+            # name, so connection names must be unique across the repo -
+            # also after normalisation (e.g. 'sc_a' and 'sc-a' would share
+            # an app registration and Key Vault entries).
+            $allNames = Get-ChildItem config -Filter *.yaml |
+              ForEach-Object { Get-DeterministicName -ConnectionName (Get-SubscriptionRequest -Path $_.FullName).ConnectionName }
+            $dupes = $allNames | Group-Object | Where-Object Count -gt 1
+            if ($dupes) {
+              Write-Log "Duplicate connection name(s) (after normalising to letters, digits and '-'): $($dupes.Name -join ', ')" -Level ERROR
+              $hasError = $true
+            }
+
+            if ($hasError) {
+              throw "Validation failed - see errors above."
+            }
+        env:
+          TARGET_BRANCH: $(System.PullRequest.TargetBranch)

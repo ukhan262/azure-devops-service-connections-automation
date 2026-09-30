@@ -1,0 +1,113 @@
+# CD: runs when a subscription request is merged to main. Every script it
+# calls is idempotent, so a retried or re-triggered run is always safe.
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - config/*.yaml
+
+pr: none
+
+parameters:
+  - name: provisionAll
+    displayName: 'Provision every config file (not just the last commit''s changes)'
+    type: boolean
+    default: false
+  - name: azureCloud
+    displayName: 'Azure cloud'
+    type: string
+    default: AzureCloud
+    values:
+      - AzureUSGovernment   # Azure Government
+      - AzureCloud          # commercial / public Azure
+  - name: poolType
+    displayName: 'Agent pool type'
+    type: string
+    default: microsoftHosted
+    values:
+      - selfHosted        # your own agents (required on Azure DevOps Server)
+      - microsoftHosted   # Azure Pipelines hosted agents (Azure DevOps Services only)
+  - name: selfHostedPoolName
+    displayName: 'Self-hosted pool name'
+    type: string
+    default: 'OnPremAgents'
+  - name: vmImage
+    displayName: 'Microsoft-hosted image'
+    type: string
+    default: 'ubuntu-latest'
+
+variables:
+  # Each cloud has its own tenant, bootstrap identity and Key Vault, so
+  # each gets its own variable group with the same variable names.
+  - ${{ if eq(parameters.azureCloud, 'AzureUSGovernment') }}:
+    - group: azure-service-connections-secrets
+  - ${{ if eq(parameters.azureCloud, 'AzureCloud') }}:
+    - group: azure-service-connections-secrets-commercial
+    # expects: TenantId, BootstrapAppId, BootstrapClientSecret,
+    #          KeyVaultName, CollectionUrl, ProjectName, PersonalAccessToken
+
+stages:
+  - stage: Provision
+    jobs:
+      - deployment: ProvisionServiceConnections
+        environment: 'production-azure-access'   # attach a security approval check here in the UI
+        # Conditionals aren't allowed inside a pipeline-level pool:, so the
+        # whole pool key is inserted conditionally at the job level instead.
+        ${{ if eq(parameters.poolType, 'selfHosted') }}:
+          pool:
+            name: ${{ parameters.selfHostedPoolName }}
+        ${{ if eq(parameters.poolType, 'microsoftHosted') }}:
+          pool:
+            vmImage: ${{ parameters.vmImage }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  fetchDepth: 2   # need the previous commit to diff against
+
+                - template: templates/install-modules.yml
+                  parameters:
+                    poolType: ${{ parameters.poolType }}
+
+                - task: PowerShell@2
+                  displayName: 'Connect and provision each changed subscription request'
+                  inputs:
+                    targetType: inline
+                    pwsh: true
+                    script: |
+                      # Connect in the same step as the work: Connect-MgGraph only lasts for
+                      # this pwsh process, and each PowerShell@2 task starts a new one.
+                      Import-Module "$(Build.SourcesDirectory)/scripts/common/Common.psm1" -Force
+                      $bootstrapSecret = ConvertTo-SecureString "$(BootstrapClientSecret)" -AsPlainText -Force
+                      Connect-AutomationContext `
+                        -TenantId "$(TenantId)" `
+                        -ApplicationId "$(BootstrapAppId)" `
+                        -ClientSecret $bootstrapSecret `
+                        -AzureCloud "${{ parameters.azureCloud }}"
+
+                      if ('${{ parameters.provisionAll }}' -eq 'True') {
+                        # Manual reconcile: every step is idempotent, so re-running for
+                        # already-provisioned configs is safe.
+                        $changed = Get-ChildItem config -Filter *.yaml | ForEach-Object { "config/$($_.Name)" }
+                      } else {
+                        $changed = git diff --name-only --diff-filter=d HEAD~1 HEAD -- config/*.yaml   # skip deleted configs
+                      }
+                      if (-not $changed) {
+                        Write-Output "No config changes in this push."
+                        exit 0
+                      }
+
+                      foreach ($file in $changed) {
+                        & "$(Build.SourcesDirectory)/scripts/Invoke-ProvisionServiceConnection.ps1" `
+                          -ConfigPath $file `
+                          -KeyVaultName "$(KeyVaultName)" `
+                          -CollectionUrl "$(CollectionUrl)" `
+                          -ProjectName "$(ProjectName)" `
+                          -PersonalAccessToken "$(PersonalAccessToken)" `
+                          -TenantId "$(TenantId)" `
+                          -AzureCloud "${{ parameters.azureCloud }}"
+                      }
